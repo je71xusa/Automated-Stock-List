@@ -141,7 +141,7 @@ def main_newsFetch():
     # In this function, we fetch the latest news for each stock using NewsAPI.
     # We are also fetching the long name of the company using yfinance for the news query.
     df = pd.read_csv('undervalued_stocks_with_return_potential.csv')
-    api_key = '70d8e15851ec48d18b3bcce727bb0e9b'  # Replace this with your NewsAPI key
+    api_key = '1234556'  # Replace this with your NewsAPI key
 
     news_data = {}
     for index, row in df.iterrows():
