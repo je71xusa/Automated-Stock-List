@@ -1,5 +1,6 @@
 import ftplib
 import datetime
+import time
 import os
 import pandas as pd
 import yfinance as yf
@@ -98,6 +99,40 @@ def round_or_none(val, decimals=2):
     except:
         return None
 
+
+def get_history_with_retries(ticker_obj, period="1y", max_retries=3, base_delay=2):
+    """
+    Attempts to get historical data from a yf.Ticker object with retries.
+
+    Args:
+        ticker_obj: A yfinance.Ticker object.
+        period (str): Data period to request.
+        max_retries (int): Maximum number of retry attempts.
+        base_delay (int): Base delay in seconds for exponential backoff.
+
+    Returns:
+        pandas.DataFrame: The historical data.
+
+    Raises:
+        Exception: If maximum retries are reached without success.
+    """
+    for attempt in range(max_retries):
+        try:
+            hist = ticker_obj.history(period=period)
+            if hist.empty:
+                raise ValueError("Empty DataFrame returned")
+            return hist
+        except Exception as e:
+            error_str = str(e)
+
+            delay = base_delay * (2 ** attempt)
+            print(f"Received {error_str} for {ticker_obj.ticker}. "
+                  f"Sleeping for {delay} seconds before retrying (attempt {attempt + 1}/{max_retries})...")
+            time.sleep(delay)
+
+    raise Exception(f"Max retries reached for ticker {ticker_obj.ticker}. Skipping.")
+
+
 def step2_yfinance_data():
     """
     1) Reads TickerInput_<date>.csv
@@ -113,42 +148,54 @@ def step2_yfinance_data():
         print(f"Ticker input file '{ticker_input_filename}' not found. Skipping Step 2.")
         print("========================================\n")
         return
+
     with open(ticker_input_filename, "r", encoding="utf-8") as f:
         line = f.readline().strip()
     tickers = line.split(",")
+
     records = []
     six_months_ago = pd.Timestamp.now(tz=None) - pd.Timedelta(days=180)
+
     for symbol in tickers:
         symbol = symbol.strip().upper()
         if not symbol:
             continue
+
         print(f"Processing ticker: {symbol}")
         try:
             ticker_obj = yf.Ticker(symbol)
-            hist_1y = ticker_obj.history(period="1y")
-            if hist_1y.empty:
-                print(f"  No 1-year data found for {symbol}. Skipping...")
-                continue
+
+            # Use the retry function instead of directly calling history()
+            hist_1y = get_history_with_retries(ticker_obj, period="1y")
+
+            # Adjust timezone if necessary
             if hist_1y.index.tz is not None:
                 hist_1y.index = hist_1y.index.tz_convert(None)
+
             current_price = hist_1y["Close"].iloc[-1]
+
             hist_6m = hist_1y[hist_1y.index >= six_months_ago]
             if hist_6m.empty:
                 print(f"  No 6-month data found for {symbol}. Skipping...")
                 continue
+
             highest_6m = hist_6m["High"].max()
             lowest_6m = hist_6m["Low"].min()
+
+            # Compute RSI
             hist_1y["RSI14"] = compute_RSI(hist_1y, window=14, column="Close")
             rsi_14 = hist_1y["RSI14"].iloc[-1]
             if pd.isna(rsi_14):
                 print(f"  RSI(14) is NaN for {symbol}. Possibly not enough data. Skipping...")
                 continue
+
             info = ticker_obj.info
             pb = info.get("priceToBook", None)
             ps = info.get("priceToSalesTrailing12Months", None)
             pe = info.get("trailingPE", None)
             target_price = info.get("targetMeanPrice", None)
             sector = info.get("sector", None)
+
             record = {
                 "Ticker": symbol,
                 "CurrentPrice": round_or_none(current_price, 2),
@@ -162,9 +209,11 @@ def step2_yfinance_data():
                 "Sector": sector
             }
             records.append(record)
+
         except Exception as e:
             print(f"  Error processing {symbol}: {e}")
             continue
+
     df = pd.DataFrame(records)
     output_filename = f"RawData_{date_str}.csv"
     if not df.empty:
@@ -172,6 +221,7 @@ def step2_yfinance_data():
         print(f"\nSuccessfully saved data to '{output_filename}'.")
     else:
         print("\nNo valid tickers found. No CSV file was created.")
+
     print("========================================\n")
 
 
@@ -610,7 +660,7 @@ def step_compute_all_metrics_raw():
 
 def main():
     # 1) Download from FTP + filter => TickerInput_<date>.csv
-    step1_download_and_filter_ftp()
+    #step1_download_and_filter_ftp()
     # 2) Use yfinance to create RawData_<date>.csv
     step2_yfinance_data()
     # 3) Filter the RawData_<date>.csv => FilteredData_<date>.csv
