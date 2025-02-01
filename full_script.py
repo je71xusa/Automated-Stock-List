@@ -1,257 +1,626 @@
-import yfinance as yf
+import ftplib
+import datetime
+import os
 import pandas as pd
+import yfinance as yf
 import numpy as np
-import requests
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
-import json
-import time
-import seaborn as sns
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler
-from matplotlib.cm import get_cmap
+import seaborn as sns
 
-# ---- Part 1: Scraping company list from multiple sources ----
+################################################################################
+# Script #1 code
+################################################################################
 
-def scrape_index_list(url, column_name):
-    tables = pd.read_html(url, header=0)
-    print(f"Total tables in {url}: {len(tables)}")  # debugging
-    for i, table in enumerate(tables):
-        print(f"Columns in the table #{i} from {url}: {table.columns}")  # debugging
-        if column_name in table.columns:
-            return table[column_name].tolist()
-    return []  # Return an empty list if no table has the column
+def step1_download_and_filter_ftp():
+    """
+    1) Connect and login to the FTP server at ftp.nasdaqtrader.com,
+       navigate to Symboldirectory, download 'nasdaqlisted.txt' and 'otherlisted.txt'.
+    2) Filter each file and create dated versions: e.g. 'nasdaqlisted_22012025.txt' => 'nasdaqlisted_22012025_filtered.txt'
+    3) Then create 'TickerInput_<date>.csv' containing all unique tickers.
+    """
+    print("=== STEP 1: Downloading and filtering from FTP ===")
+    ftp_server = ftplib.FTP("ftp.nasdaqtrader.com")
+    ftp_server.login()
+    ftp_server.encoding = "utf-8"
+    ftp_server.cwd("Symboldirectory")
+    filenames = ["nasdaqlisted.txt", "otherlisted.txt"]
+    today = datetime.date.today()
+    date_str = today.strftime("%d%m%Y")
+    filtered_files = []
 
-def main_getSymbols(urls):
-    # In this function, we will scrape the symbols from multiple sources.
-    # The sources are Wikipedia pages which list the symbols of the companies in certain stock market indices.
-    symbols = []
-    for url, column_name in urls.items():
-        symbols.extend(scrape_index_list(url, column_name))
-    symbols = list(set(symbols))  # Remove duplicate symbols
-    print(f"Found {len(symbols)} unique symbols.")
-    return symbols
+    for filename in filenames:
+        dated_filename = filename.replace(".txt", f"_{date_str}.txt")
+        with open(dated_filename, "wb") as local_file:
+            ftp_server.retrbinary(f"RETR {filename}", local_file.write)
+        base_name, ext = os.path.splitext(dated_filename)
+        filtered_filename = f"{base_name}_filtered{ext}"
+        with open(dated_filename, "r", encoding="utf-8") as infile, \
+             open(filtered_filename, "w", encoding="utf-8") as outfile:
+            lines = infile.readlines()
+            header = lines[0]
+            outfile.write(header)
+            header_cols = header.strip().split("|")
+            etf_index = header_cols.index("ETF")
+            test_index = header_cols.index("Test Issue")
+            if filename == "nasdaqlisted.txt":
+                fin_index = header_cols.index("Financial Status")
+            for line in lines[1:]:
+                row = line.strip().split("|")
+                if row[etf_index] == "N" and row[test_index] == "N":
+                    if filename == "nasdaqlisted.txt":
+                        if row[fin_index] == "N":
+                            outfile.write(line)
+                    else:
+                        outfile.write(line)
+        filtered_files.append(filtered_filename)
 
-# ---- Part 2: Getting metrics for each company using yfinance ----
+    ftp_server.quit()
 
-def get_stock_info_yfinance(symbols):
-    """Retrieve stock information and historical data for the symbols from Yahoo Finance."""
-    stock_info = {}
-    periods = ["7d", "1mo"]
-    for symbol in symbols:
-        print(symbols.index(symbol), "/", len(symbols))
+    unique_tickers = set()
+    for ffile in filtered_files:
+        with open(ffile, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            for line in lines[1:]:
+                row = line.strip().split("|")
+                ticker_symbol = row[0]
+                unique_tickers.add(ticker_symbol)
+    ticker_input_filename = f"TickerInput_{date_str}.csv"
+    with open(ticker_input_filename, "w", encoding="utf-8") as outfile:
+        outfile.write(",".join(sorted(unique_tickers)))
+    print("Done. Created filtered files and combined ticker CSV:", ticker_input_filename)
+    print("========================================\n")
+
+
+################################################################################
+# Script #4 code
+################################################################################
+
+def compute_RSI(data, window=14, column='Close'):
+    """
+    Computes RSI using a simple average gain/loss method.
+    Returns a pandas Series of RSI values.
+    """
+    delta = data[column].diff()
+    gains = delta.clip(lower=0)
+    losses = -1 * delta.clip(upper=0)
+    avg_gain = gains.rolling(window=window).mean()
+    avg_loss = losses.rolling(window=window).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def round_or_none(val, decimals=2):
+    """Round val to 'decimals' places if it's a real number, else None."""
+    if val is None or pd.isna(val):
+        return None
+    try:
+        return round(float(val), decimals)
+    except:
+        return None
+
+def step2_yfinance_data():
+    """
+    1) Reads TickerInput_<date>.csv
+    2) For each ticker, downloads ~1 year of data from Yahoo Finance, extracts
+       current price, 6M high/low, RSI(14), plus fundamentals (P/B, P/S, P/E, TargetPrice, Sector).
+    3) Saves to RawData_<date>.csv
+    """
+    print("=== STEP 2: Downloading data from yfinance ===")
+    today = datetime.date.today()
+    date_str = today.strftime("%d%m%Y")
+    ticker_input_filename = f"TickerInput_{date_str}.csv"
+    if not os.path.exists(ticker_input_filename):
+        print(f"Ticker input file '{ticker_input_filename}' not found. Skipping Step 2.")
+        print("========================================\n")
+        return
+    with open(ticker_input_filename, "r", encoding="utf-8") as f:
+        line = f.readline().strip()
+    tickers = line.split(",")
+    records = []
+    six_months_ago = pd.Timestamp.now(tz=None) - pd.Timedelta(days=180)
+    for symbol in tickers:
+        symbol = symbol.strip().upper()
+        if not symbol:
+            continue
+        print(f"Processing ticker: {symbol}")
         try:
-            stock = yf.Ticker(symbol)
-            info = stock.info
-            if not info:
-                print(f"No info available for {symbol}")
+            ticker_obj = yf.Ticker(symbol)
+            hist_1y = ticker_obj.history(period="1y")
+            if hist_1y.empty:
+                print(f"  No 1-year data found for {symbol}. Skipping...")
                 continue
-            if 'currentPrice' in info:
-                current_price = info['currentPrice']
-                stock_info[symbol] = {"current_price": current_price}
-
-                # Get historical data and calculate high and low values for each period
-                for period in periods:
-                    hist = stock.history(period=period)
-                    stock_info[symbol][f"{period}_high"] = hist["High"].max()
-                    stock_info[symbol][f"{period}_low"] = hist["Low"].min()
-                    stock_info[symbol][f"is_in_low_10pct_{period}"] = current_price <= (hist["Low"].min() + 0.1 * (hist["High"].max() - hist["Low"].min()))
+            if hist_1y.index.tz is not None:
+                hist_1y.index = hist_1y.index.tz_convert(None)
+            current_price = hist_1y["Close"].iloc[-1]
+            hist_6m = hist_1y[hist_1y.index >= six_months_ago]
+            if hist_6m.empty:
+                print(f"  No 6-month data found for {symbol}. Skipping...")
+                continue
+            highest_6m = hist_6m["High"].max()
+            lowest_6m = hist_6m["Low"].min()
+            hist_1y["RSI14"] = compute_RSI(hist_1y, window=14, column="Close")
+            rsi_14 = hist_1y["RSI14"].iloc[-1]
+            if pd.isna(rsi_14):
+                print(f"  RSI(14) is NaN for {symbol}. Possibly not enough data. Skipping...")
+                continue
+            info = ticker_obj.info
+            pb = info.get("priceToBook", None)
+            ps = info.get("priceToSalesTrailing12Months", None)
+            pe = info.get("trailingPE", None)
+            target_price = info.get("targetMeanPrice", None)
+            sector = info.get("sector", None)
+            record = {
+                "Ticker": symbol,
+                "CurrentPrice": round_or_none(current_price, 2),
+                "High_6M": round_or_none(highest_6m, 2),
+                "Low_6M": round_or_none(lowest_6m, 2),
+                "RSI14": round_or_none(rsi_14, 2),
+                "P/B": round_or_none(pb, 2),
+                "P/S": round_or_none(ps, 2),
+                "P/E": round_or_none(pe, 2),
+                "TargetPrice": round_or_none(target_price, 2),
+                "Sector": sector
+            }
+            records.append(record)
         except Exception as e:
-            print(f"Error retrieving info for {symbol}: {e}")
-    return stock_info
+            print(f"  Error processing {symbol}: {e}")
+            continue
+    df = pd.DataFrame(records)
+    output_filename = f"RawData_{date_str}.csv"
+    if not df.empty:
+        df.to_csv(output_filename, index=False)
+        print(f"\nSuccessfully saved data to '{output_filename}'.")
+    else:
+        print("\nNo valid tickers found. No CSV file was created.")
+    print("========================================\n")
 
 
-def filter_stocks(stock_info):
-    filtered_stocks = {}
-    for symbol, info in stock_info.items():
-        try:
-            if info['is_in_low_10pct_1mo'] or info['is_in_low_10pct_7d']:
-                filtered_stocks[symbol] = info
-        except KeyError as e:
-            print(f"Error for {symbol}: {e}")
-            print(f"Available keys: {info.keys()}")
+################################################################################
+# Script #2 code
+################################################################################
 
-    return filtered_stocks
+def step3_filter_raw_data():
+    """
+    1) Reads RawData_<date>.csv
+    2) Filters on:
+       - TargetPrice > CurrentPrice
+       - P/B, P/S, P/E > -2
+       - CurrentPrice > 10
+       - RSI14 < 40
+    3) Saves FilteredData_<date>.csv
+    """
+    print("=== STEP 3: Filtering RawData_<date>.csv ===")
+    today = datetime.date.today()
+    date_str = today.strftime("%d%m%Y")
+    raw_csv = f"RawData_{date_str}.csv"
+    if not os.path.exists(raw_csv):
+        print(f"File '{raw_csv}' not found. Skipping Step 3.")
+        print("========================================\n")
+        return
+    df = pd.read_csv(raw_csv)
+    required_cols = ["Ticker", "CurrentPrice", "TargetPrice", "P/B", "P/S", "P/E", "RSI14"]
+    for col in required_cols:
+        if col not in df.columns:
+            print(f"Error: '{col}' column not found in '{raw_csv}'. Cannot filter.")
+            print("========================================\n")
+            return
+    condition = (
+        (df["TargetPrice"] > df["CurrentPrice"]) &
+        (df["P/B"] > -2) &
+        (df["P/S"] > -2) &
+        (df["P/E"] > -2) &
+        (df["CurrentPrice"] > 10) &
+        (df["RSI14"] < 40)
+    )
+    filtered_df = df[condition].copy()
+    filtered_csv = f"FilteredData_{date_str}.csv"
+    filtered_df.to_csv(filtered_csv, index=False)
+    print(f"Filtered data saved to '{filtered_csv}'.")
+    print(f"Number of rows after filtering: {len(filtered_df)}")
+    print("========================================\n")
 
 
-def main_getMetrics(symbols):
-    # In this function, we retrieve stock information and historical data for the symbols.
-    # We are using Yahoo Finance for this.
-    data = get_stock_info_yfinance(symbols)
-    # Save all data to a CSV file
-    df = pd.DataFrame(data).T
-    df.to_csv('all_stock_data.csv')
-    print("All data saved to all_stock_data.csv")
+################################################################################
+# Script #5 code
+################################################################################
 
-    # Filter and save selected stocks to a CSV file
-    filtered_data = filter_stocks(data)
-    df_filtered = pd.DataFrame(filtered_data).T
-    df_filtered.to_csv('filtered_stock_data.csv')
-    print("Filtered stock data saved to filtered_stock_data.csv")
+def step4_plot_histograms():
+    """
+    Reads RawData_<date>.csv, groups by 'Sector', and plots histograms for P/E, P/S, P/B.
+    Saves plots under a 'Plots' subdirectory.
+    """
+    print("=== STEP 4: Creating histograms by sector from RawData_<date>.csv ===")
+    today = datetime.date.today()
+    date_str = today.strftime("%d%m%Y")
+    csv_filename = f"RawData_{date_str}.csv"
+    if not os.path.exists(csv_filename):
+        print(f"File '{csv_filename}' not found. Skipping Step 4.")
+        print("========================================\n")
+        return
+    df = pd.read_csv(csv_filename)
+    metrics = ["P/E", "P/S", "P/B"]
+    sector_column = "Sector"
+    plot_dir = "Plots"
+    if not os.path.exists(plot_dir):
+        os.makedirs(plot_dir)
+    if sector_column not in df.columns:
+        print(f"Error: '{sector_column}' column not found in CSV. Skipping histograms.")
+        print("========================================\n")
+        return
+    grouped = df.groupby(sector_column, dropna=True)
+    for sector_name, group_df in grouped:
+        if pd.isna(sector_name) or str(sector_name).strip() == "":
+            continue
+        for metric in metrics:
+            if metric not in group_df.columns:
+                print(f"Warning: '{metric}' column not found. Skipping...")
+                continue
+            data_raw = group_df[metric]
+            data_numeric = pd.to_numeric(data_raw, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+            if data_numeric.empty:
+                print(f"No valid (finite) data for {metric} in sector '{sector_name}'. Skipping...")
+                continue
+            plt.figure(figsize=(8, 5))
+            plt.hist(data_numeric, bins=200, edgecolor="black", alpha=0.7)
+            plt.title(f"{metric} Histogram - Sector: {sector_name}")
+            plt.xlabel(metric)
+            plt.ylabel("Frequency")
+            safe_sector_name = str(sector_name).replace("/", "_").replace("\\", "_").replace(" ", "_")
+            safe_metric_name = metric.replace("/", "_").replace("\\", "_")
+            output_file = os.path.join(plot_dir, f"{safe_sector_name}_{safe_metric_name}_hist.png")
+            plt.savefig(output_file, dpi=100)
+            plt.close()
+            print(f"Saved histogram for {metric} in sector '{sector_name}' to '{output_file}'")
+    print("========================================\n")
 
-# ---- Part 3: Calculating the potential return ----
 
-def calculate_potential_return(df, return_threshold):
-    """Calculate the potential return for the stocks and add the data to a new column."""
-    for period in ["7d", "1mo"]:
-        df[f"{period}_return_potential"] = df.apply(
-            lambda row: (row[f"{period}_high"] - row["current_price"]) / row["current_price"] * 100
-            if row[f"is_in_low_10pct_{period}"] else 0, axis=1)
-    return df
+################################################################################
+# Script #3 code (Processing AllMetricsRaw if present)
+################################################################################
 
-def filter_stocks_for_return(df, return_threshold):
-    """Filter the stocks that have the potential to give at least a return_threshold return."""
-    df = calculate_potential_return(df, return_threshold)
-    df_filtered = df[(df["7d_return_potential"] >= return_threshold) |
-                     (df["1mo_return_potential"] >= return_threshold)]
-    return df_filtered
-
-def main_calcMetrics():
-    # In this function, we calculate the potential return for each stock and filter the stocks based on the potential return.
-    df = pd.read_csv('filtered_stock_data.csv', index_col=0)
-    return_threshold = 10.0  # We want at least 5% return
-    df_filtered = filter_stocks_for_return(df, return_threshold)
-    df_filtered.to_csv('undervalued_stocks_with_return_potential.csv')
-    print("Filtered data saved to undervalued_stocks_with_return_potential.csv")
-
-# ---- Part 4: Fetching the news using NewsAPI and yfinance ----
-
-def fetch_news(api_key, symbol, company_name):
-    base_url = 'https://newsapi.org/v2/everything'
-    parameters = {
-        'q': f"{symbol} OR {company_name}",  # search for both symbol and company name
-        'language': 'en',
-        'sortBy': 'publishedAt',
-        'apiKey': api_key
+def step5_process_allMetricsRaw():
+    """
+    Looks for 'AllMetricsRaw_<date>.csv'
+    Applies filtering rules on certain metrics and plots side-by-side heatmaps.
+    Saves a filtered CSV 'AllMetricsRaw_<date>_FILTERED.csv'.
+    """
+    print("=== STEP 5: Processing AllMetricsRaw_<date>.csv (if present) ===")
+    today = datetime.date.today()
+    date_str = today.strftime("%d%m%Y")
+    raw_csv_file = f"AllMetricsRaw_{date_str}.csv"
+    if not os.path.exists(raw_csv_file):
+        print(f"File '{raw_csv_file}' not found. Skipping Step 5.")
+        print("========================================\n")
+        return
+    df_raw = pd.read_csv(raw_csv_file, index_col=0)
+    if df_raw.empty:
+        print("CSV is empty or invalid. Skipping Step 5.")
+        print("========================================\n")
+        return
+    required_metrics = [
+        "PossibleWinning",
+        "MA50_vs_MA200",
+        "DaysTo_MA50_MA200_Cross",
+        "MACD_vs_Signal",
+        "DaysTo_MACD_Signal_Cross"
+    ]
+    for rm in required_metrics:
+        if rm not in df_raw.index:
+            print(f"Required metric '{rm}' not found in CSV. Aborting Step 5.")
+            print("========================================\n")
+            return
+    df_raw = df_raw.apply(pd.to_numeric, errors="coerce")
+    valid_tickers = []
+    for ticker in df_raw.columns:
+        pw_val = df_raw.loc["PossibleWinning", ticker]
+        if pd.isna(pw_val) or pw_val < 1.05:
+            continue
+        macd_vs_signal = df_raw.loc["MACD_vs_Signal", ticker]
+        days_macd = df_raw.loc["DaysTo_MACD_Signal_Cross", ticker]
+        macd_below_soon = (macd_vs_signal == -1) and (days_macd < 60)
+        if macd_below_soon:
+            valid_tickers.append(ticker)
+            continue
+        ma50_vs_ma200 = df_raw.loc["MA50_vs_MA200", ticker]
+        days_ma = df_raw.loc["DaysTo_MA50_MA200_Cross", ticker]
+        ma_condition = ((ma50_vs_ma200 == 1) or ((ma50_vs_ma200 == -1) and (days_ma < 60)))
+        macd_condition = ((macd_vs_signal == 1) or ((macd_vs_signal == -1) and (days_macd < 60)))
+        if ma_condition and macd_condition:
+            valid_tickers.append(ticker)
+    valid_tickers = list(set(valid_tickers))
+    if not valid_tickers:
+        print("No tickers pass the filtering conditions in AllMetricsRaw. Exiting Step 5.")
+        print("========================================\n")
+        return
+    df_filtered = df_raw.loc[:, valid_tickers]
+    pw_series = df_filtered.loc["PossibleWinning"].dropna()
+    if not pw_series.empty:
+        sorted_tickers = pw_series.sort_values(ascending=False).index.tolist()
+    else:
+        sorted_tickers = df_filtered.columns.tolist()
+    metrics = df_filtered.index.tolist()
+    n_metrics = len(metrics)
+    metric_plot_config = {
+        "RSI": {"cmap": "Reds_r", "vmin": 0, "vmax": 100},
+        "PossibleWinning": {"cmap": "Reds"},
+        "MA50_vs_MA200": {"cmap": "Reds", "vmin": -1, "vmax": 1},
+        "DaysTo_MA50_MA200_Cross": {"cmap": "Reds_r"},
+        "MACD_vs_Signal": {"cmap": "Reds", "vmin": -1, "vmax": 1},
+        "DaysTo_MACD_Signal_Cross": {"cmap": "Reds_r"},
+        "P/B": {"cmap": "Reds_r"},
+        "P/S": {"cmap": "Reds_r"},
+        "P/E": {"cmap": "Reds_r"},
+        "Volume_Change_20d": {"cmap": "Reds"},
+        "Short_Interest_Ratio": {"cmap": "Reds"},
+        "Float_Short_Pct": {"cmap": "Reds"},
+        "DividendYield_Pct": {"cmap": "Reds"},
+        "DaysToExDiv": {"cmap": "Reds_r"}
     }
-
-    response = requests.get(base_url, params=parameters)
-
-    if response.status_code != 200:
-        print(f"Failed to fetch news for {symbol} ({company_name}), status code: {response.status_code}")
-        return []
-
-    news_data = response.json()
-    return news_data['articles']
-
-def get_company_name(symbol):
-    ticker = yf.Ticker(symbol)
-    return ticker.info['longName']
-
-def main_newsFetch():
-    # In this function, we fetch the latest news for each stock using NewsAPI.
-    # We are also fetching the long name of the company using yfinance for the news query.
-    df = pd.read_csv('undervalued_stocks_with_return_potential.csv')
-    api_key = '1234556'  # Replace this with your NewsAPI key
-
-    news_data = {}
-    for index, row in df.iterrows():
-        symbol = row[0]  # Get the symbol from the first column
-        company_name = get_company_name(symbol)  # Fetch company name
-        articles = fetch_news(api_key, symbol, company_name)
-        news_data[symbol] = articles
-
-    with open('stock_news_data.json', 'w') as f:
-        json.dump(news_data, f)
-
-# ---- Part 5: Performing sentiment analysis on the news titles ----
-
-def get_sentiment_score(article, analyzer):
-    return analyzer.polarity_scores(article['title'])['compound']
-
-def calculate_average_sentiment(sentiments):
-    if sentiments:
-        return sum(sentiments) / len(sentiments)
-    return 0  # Return neutral sentiment if no news articles
-
-def main_sentiment():
-    # In this function, we perform sentiment analysis on the news titles for each stock.
-    # We then save the average sentiment to the dataframe and export it to a CSV file.
-    df = pd.read_csv('undervalued_stocks_with_return_potential.csv')
-
-    with open('stock_news_data.json', 'r') as f:
-        news_data = json.load(f)
-
-    analyzer = SentimentIntensityAnalyzer()
-    sentiment_data = {}
-
-    for index, row in df.iterrows():
-        symbol = row[0]  # Get the symbol from the first column
-        articles = news_data.get(symbol, [])
-        sentiment_scores = [get_sentiment_score(article, analyzer) for article in articles]
-        sentiment_data[symbol] = calculate_average_sentiment(sentiment_scores)
-
-    # Add sentiment data to the DataFrame and save to a new CSV file
-    df['average_sentiment'] = df.iloc[:, 0].map(sentiment_data)
-    df.to_csv('undervalued_stocks_with_sentiment.csv', index=False)
-
-# ---- Visualization of data ----
-def main_visualization():
-    df = pd.read_csv('undervalued_stocks_with_sentiment.csv')
-    df.rename(columns={'Unnamed: 0': 'Symbol'}, inplace=True)
-    df.set_index('Symbol', inplace=True)  # Make sure 'Symbol' is the index of the DataFrame.
-    # Making a grouped barplot that is ordered according to sentiment score
-    # Order stocks by sentiment
-    df.sort_values('average_sentiment', ascending=False, inplace=True)
-
-    # Add sentiment score to the stock name for the plot
-    df.index = df.index + ' (' + df['average_sentiment'].round(2).astype(str) + ')'
-    # Set color palette
-    n_stocks = len(df)
-    cmap = get_cmap('viridis')
-    colors = cmap(np.linspace(0, 1, n_stocks))
-
-    fig, axs = plt.subplots(3, 1, figsize=(14, 50), sharex=True)
-
-    # Plotting 1mo_return_potential
-    df['1mo_return_potential'].plot(kind='bar', ax=axs[1], color=colors)
-    axs[1].set_title('1-Month Return Potential Sorted by Sentiment Score')
-    axs[1].set_ylabel('1-Month Potential Return (%)')
-
-    # Plotting 7d_return_potential
-    df['7d_return_potential'].plot(kind='bar', ax=axs[2], color=colors)
-    axs[2].set_title('7-Day Return Potential Sorted by Sentiment Score')
-    axs[2].set_ylabel('7-Day Potential Return (%)')
-
-    plt.xlabel('Stocks')
-    plt.xticks(rotation=90)
+    fig, axes = plt.subplots(
+        nrows=1,
+        ncols=n_metrics,
+        figsize=(2.0 * n_metrics, max(6, 0.4 * len(sorted_tickers)))
+    )
+    if n_metrics == 1:
+        axes = [axes]
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+        data_series = df_filtered.loc[metric].reindex(sorted_tickers)
+        mini_df = pd.DataFrame(data_series, columns=[metric])
+        cfg = metric_plot_config.get(metric, {})
+        cmap = cfg.get("cmap", "Reds")
+        vmin = cfg.get("vmin", None)
+        vmax = cfg.get("vmax", None)
+        sns.heatmap(
+            mini_df,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            annot=True,
+            fmt=".2f",
+            ax=ax,
+            cbar=False
+        )
+        ax.set_title(metric, fontsize=10)
+        ax.set_xlabel("")
+        ax.set_ylabel("Ticker")
     plt.tight_layout()
-    plt.savefig('barplots_sorted_by_sentiment.png')
-
-    # In this function, we create a heatmap for the calculated metrics.
-
-    # Normalize data for better visualization
-    scaler = MinMaxScaler()
-    scaled_values = scaler.fit_transform(df)
-    df.loc[:,:] = scaled_values
-
-    # We will use the '7d_return_potential', '1mo_return_potential', and 'average_sentiment' columns
-    metrics_df = df[['7d_return_potential', '1mo_return_potential', 'average_sentiment']]
-
-    # Create a heatmap
-    plt.figure(figsize=(14,14))
-    sns.heatmap(metrics_df, annot=True, cmap='coolwarm')
-    plt.title('Metrics Heatmap')
-    plt.savefig('metrics_heatmap.png')  # Save the figure as a PNG image
+    out_fig = f"FilteredSubplots_{date_str}.png"
+    plt.savefig(out_fig, dpi=150)
+    plt.close()
+    print(f"Done. Filtered plot saved to '{out_fig}'.")
+    filtered_csv_file = f"AllMetricsRaw_{date_str}_FILTERED.csv"
+    df_filtered.to_csv(filtered_csv_file)
+    print(f"Filtered data saved to '{filtered_csv_file}'.")
+    print("========================================\n")
 
 
+################################################################################
+# Additional Helper Functions
+################################################################################
+
+def compute_rsi(series_close, window=14):
+    """
+    Compute RSI using a simple average gain/loss method.
+    Returns a Pandas Series of RSI values.
+    """
+    delta = series_close.diff()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+    avg_gain = gains.rolling(window=window).mean()
+    avg_loss = losses.rolling(window=window).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def get_macd_and_signal(series_close, fast=12, slow=26, signal=9):
+    """
+    Calculate MACD (fast EMA - slow EMA) and signal line (EMA of MACD).
+    Returns two Pandas Series: (macd, macd_signal).
+    """
+    ema_fast = series_close.ewm(span=fast, adjust=False).mean()
+    ema_slow = series_close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    return macd, macd_signal
+
+def days_to_cross_zero(current_diff, last_diffs):
+    """
+    Estimate how many days until 'current_diff' hits zero,
+    based on the average daily change in 'last_diffs'.
+    If the slope is pushing away from zero or is zero, return NaN.
+    """
+    if len(last_diffs) < 2:
+        return np.nan
+    diffs = np.diff(last_diffs)
+    avg_slope = np.mean(diffs)
+    if avg_slope == 0:
+        return np.nan
+    if (current_diff > 0 and avg_slope > 0) or (current_diff < 0 and avg_slope < 0):
+        return np.nan
+    return abs(current_diff) / abs(avg_slope)
 
 
-# ---- The main function to rule them all ----
+################################################################################
+# New Step: Compute AllMetricsRaw from FilteredData CSV
+################################################################################
+
+def step_compute_all_metrics_raw():
+    """
+    Computes additional technical metrics from FilteredData_<date>.csv
+    and saves them to AllMetricsRaw_<date>.csv.
+    """
+    print("=== STEP X: Computing all metrics from FilteredData_<date>.csv ===")
+    today = datetime.date.today()
+    date_str = today.strftime("%d%m%Y")
+    filtered_file = f"FilteredData_{date_str}.csv"
+    if not os.path.exists(filtered_file):
+        print(f"File '{filtered_file}' not found. Skipping step_compute_all_metrics_raw.")
+        print("========================================\n")
+        return
+    df_filtered = pd.read_csv(filtered_file)
+    if "Ticker" not in df_filtered.columns:
+        print("No 'Ticker' column in filtered CSV. Skipping step_compute_all_metrics_raw.")
+        return
+    tickers = df_filtered["Ticker"].dropna().unique().tolist()
+    if not tickers:
+        print("No tickers found in filtered CSV. Skipping step_compute_all_metrics_raw.")
+        return
+    metric_list = [
+        "PossibleWinning",
+        "MA50_vs_MA200",
+        "DaysTo_MA50_MA200_Cross",
+        "MACD_vs_Signal",
+        "DaysTo_MACD_Signal_Cross",
+        "RSI",
+        "P/B", "P/S", "P/E",
+        "Volume_Change_10d",
+        "Short_Interest_Ratio",
+        "Float_Short_Pct",
+        "DividendYield_Pct",
+        "DaysToExDiv"
+    ]
+    master = {m: {} for m in metric_list}
+    for sym in tickers:
+        sym = sym.upper()
+        print(f"Processing {sym}...")
+        try:
+            ticker_obj = yf.Ticker(sym)
+            hist = ticker_obj.history(period="1y")
+            if hist.empty:
+                print(f"  No 1y data for {sym}, skipping.")
+                continue
+            if hist.index.tz is not None:
+                hist.index = hist.index.tz_convert(None)
+            # Compute moving averages
+            hist["MA50"] = hist["Close"].rolling(50).mean()
+            hist["MA200"] = hist["Close"].rolling(200).mean()
+            # Compute RSI using the new helper function
+            hist["RSI14"] = compute_rsi(hist["Close"], 14)
+            # Compute MACD and signal line
+            macd, macd_signal = get_macd_and_signal(hist["Close"])
+            hist["MACD"] = macd
+            hist["MACD_Signal"] = macd_signal
+            latest = hist.iloc[-1]
+            current_price = float(latest["Close"])
+            # Fundamentals
+            info = ticker_obj.info
+            target_price = info.get("targetMeanPrice", np.nan)
+            pb = info.get("priceToBook", np.nan)
+            ps = info.get("priceToSalesTrailing12Months", np.nan)
+            pe = info.get("trailingPE", np.nan)
+            short_ratio = info.get("shortRatio", np.nan)
+            float_short_pct = info.get("sharesPercentSharesOut", np.nan)
+            if not pd.isna(float_short_pct):
+                float_short_pct *= 100.0
+            else:
+                float_short_pct = np.nan
+            div_yield = info.get("dividendYield", 0.0)
+            if not pd.isna(div_yield):
+                div_yield *= 100.0
+            ex_div_raw = info.get("exDividendDate", None)
+            if ex_div_raw:
+                try:
+                    ex_div_date = pd.to_datetime(ex_div_raw, unit='s', errors='coerce')
+                    if pd.isna(ex_div_date):
+                        ex_div_date = pd.to_datetime(ex_div_raw, errors='coerce')
+                except:
+                    ex_div_date = np.nan
+            else:
+                ex_div_date = np.nan
+            if not pd.isna(ex_div_date):
+                days_to_ex_div = (ex_div_date.date() - datetime.date.today()).days
+                if days_to_ex_div < 0:
+                    days_to_ex_div = 300
+            else:
+                days_to_ex_div = np.nan
+            # Compute PossibleWinning
+            if (not pd.isna(target_price)) and target_price > 0 and current_price > 0:
+                possible_winning = target_price / current_price
+            else:
+                possible_winning = np.nan
+            # Compute MA50 vs MA200
+            ma50 = latest.get("MA50", np.nan)
+            ma200 = latest.get("MA200", np.nan)
+            if pd.isna(ma50) or pd.isna(ma200):
+                ma50_vs_ma200 = np.nan
+            else:
+                ma50_vs_ma200 = 1 if ma50 > ma200 else -1
+            # DaysTo_MA50_MA200_Cross
+            ma_diff = hist["MA50"] - hist["MA200"]
+            if ma_diff.dropna().empty:
+                days_to_ma_cross = np.nan
+            else:
+                current_madiff = ma_diff.iloc[-1]
+                last_20_madiffs = ma_diff.dropna().iloc[-20:].values
+                days_to_ma_cross = days_to_cross_zero(current_madiff, last_20_madiffs)
+            # MACD vs Signal
+            macd_val = latest.get("MACD", np.nan)
+            macd_sig = latest.get("MACD_Signal", np.nan)
+            if pd.isna(macd_val) or pd.isna(macd_sig):
+                macd_vs_signal = np.nan
+            else:
+                macd_vs_signal = 1 if macd_val > macd_sig else -1
+            # DaysTo_MACD_Signal_Cross
+            macd_diff = hist["MACD"] - hist["MACD_Signal"]
+            if macd_diff.dropna().empty:
+                days_to_macd_cross = np.nan
+            else:
+                current_macd_diff = macd_diff.iloc[-1]
+                last_20_macd_diffs = macd_diff.dropna().iloc[-20:].values
+                days_to_macd_cross = days_to_cross_zero(current_macd_diff, last_20_macd_diffs)
+            # RSI from latest row
+            raw_rsi = latest.get("RSI14", np.nan)
+            # Volume Change 10d
+            hist["Volume_10dAgo"] = hist["Volume"].shift(10)
+            vol_10d_ago = hist["Volume_10dAgo"].iloc[-1] if not hist["Volume_10dAgo"].dropna().empty else np.nan
+            if pd.isna(vol_10d_ago) or vol_10d_ago == 0:
+                vol_change_10d = np.nan
+            else:
+                vol_change_10d = latest["Volume"] / vol_10d_ago
+            master["PossibleWinning"][sym]         = possible_winning
+            master["MA50_vs_MA200"][sym]           = ma50_vs_ma200
+            master["DaysTo_MA50_MA200_Cross"][sym] = days_to_ma_cross
+            master["MACD_vs_Signal"][sym]          = macd_vs_signal
+            master["DaysTo_MACD_Signal_Cross"][sym]= days_to_macd_cross
+            master["RSI"][sym]                     = raw_rsi
+            master["P/B"][sym]                     = pb
+            master["P/S"][sym]                     = ps
+            master["P/E"][sym]                     = pe
+            master["Volume_Change_10d"][sym]       = vol_change_10d
+            master["Short_Interest_Ratio"][sym]    = short_ratio
+            master["Float_Short_Pct"][sym]         = float_short_pct
+            master["DividendYield_Pct"][sym]       = div_yield
+            master["DaysToExDiv"][sym]             = days_to_ex_div
+        except Exception as exc:
+            print(f"Error processing {sym}: {exc}")
+            continue
+    df_raw = pd.DataFrame(master).transpose()
+    df_raw = df_raw.apply(pd.to_numeric, errors='coerce')
+    df_raw.dropna(how='all', axis=1, inplace=True)
+    raw_outfile = f"AllMetricsRaw_{date_str}.csv"
+    df_raw.to_csv(raw_outfile)
+    print(f"Saved raw metrics to '{raw_outfile}'.")
+    print("========================================\n")
+
+
+################################################################################
+# Combine everything in one main() function
+################################################################################
+
+def main():
+    # 1) Download from FTP + filter => TickerInput_<date>.csv
+    step1_download_and_filter_ftp()
+    # 2) Use yfinance to create RawData_<date>.csv
+    step2_yfinance_data()
+    # 3) Filter the RawData_<date>.csv => FilteredData_<date>.csv
+    step3_filter_raw_data()
+    # 4) Create histograms (P/E, P/S, P/B) from RawData_<date>.csv => saved in 'Plots' dir
+    step4_plot_histograms()
+    # 5) NEW STEP: Compute AllMetricsRaw_<date>.csv from FilteredData_<date>.csv
+    step_compute_all_metrics_raw()
+    # 6) Process AllMetricsRaw_<date>.csv (if you have it) => side-by-side heatmap + CSV
+    step5_process_allMetricsRaw()
 
 if __name__ == "__main__":
-    start_time = time.time()
-    urls = {
-        'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies': 'Symbol',
-        'https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average': 'Symbol',
-        'https://en.wikipedia.org/wiki/NASDAQ-100': 'Ticker',
-        'https://en.wikipedia.org/wiki/EURO_STOXX_50': 'Ticker'
-    }
-    symbols = main_getSymbols(urls)
-    main_getMetrics(symbols)
-    main_calcMetrics()
-    main_newsFetch()
-    main_sentiment()
-    main_visualization()
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    print(f"Elapsed run time: {elapsed_time/60} minutes")
+    main()
